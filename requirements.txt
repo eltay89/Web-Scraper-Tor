@@ -1,3 +1,9 @@
-requests
-beautifulsoup4
-stem
+requests>=2.28.2
+beautifulsoup4>=4.11.2
+selenium>=4.8.3
+stem>=1.8.1
+tkinter>=0.1.0
+ttkthemes>=3.2.2
+scrapy>=2.8.0
+pandas>=1.5.3
+scrolledtext>=1.0.0

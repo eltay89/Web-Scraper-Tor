@@ -9,6 +9,9 @@ from stem.control import Controller
 import time
 import os
 import json
+from modules.pagination_csv import PaginationHandler, CSVExporter
+from modules.javascript_rendering import JavaScriptRenderer
+from modules.form_submission import FormSubmitter
 
 # --- Constants ---
 TOR_SOCKS_PORT = 9150  # Default Tor Browser SOCKS port
@@ -18,6 +21,9 @@ SETTINGS_FILE = "settings.json"
 
 # --- Enhanced CSS Selectors ---
 CSS_SELECTORS = {
+    "Whole Website": {
+        "Entire Page": "*"
+    },
     "Basic Elements": {
         "All Elements": "*",
         "Headings (h1-h6)": "h1, h2, h3, h4, h5, h6",
@@ -169,25 +175,102 @@ class ScrapeThread(threading.Thread):
 
             proxies = {}
             if self.network_option == "HTTP Proxy":
-                proxies = {'http': f'http://{self.proxy_address}', 'https': f'http://{self.proxy_address}'}
+                if self.proxy_list:
+                    # Rotate proxies with error handling
+                    max_retries = len(self.proxy_list)
+                    retries = 0
+                    while retries < max_retries:
+                        try:
+                            proxy = self.proxy_list[self.current_proxy_index]
+                            proxies = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
+                            
+                            # Test the proxy
+                            test_response = requests.get("https://api.ipify.org?format=json",
+                                                       proxies=proxies,
+                                                       timeout=5)
+                            test_response.raise_for_status()
+                            
+                            # Update status with current proxy
+                            self.app.status_label.config(text=f"Using proxy: {proxy}")
+                            self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxy_list)
+                            break
+                        except Exception as e:
+                            # Mark bad proxy and try next one
+                            self.proxy_list.pop(self.current_proxy_index)
+                            if not self.proxy_list:
+                                raise Exception("All proxies failed")
+                            if self.current_proxy_index >= len(self.proxy_list):
+                                self.current_proxy_index = 0
+                            retries += 1
+                else:
+                    proxies = {'http': f'http://{self.proxy_address}', 'https': f'http://{self.proxy_address}'}
             elif self.network_option == "Tor Network":
                 proxies = {'http': f'socks5h://{self.settings.get("tor_socks_ip", "127.0.0.1")}:{self.settings.get("tor_socks_port", TOR_SOCKS_PORT)}', 'https': f'socks5h://{self.settings.get("tor_socks_ip", "127.0.0.1")}:{self.settings.get("tor_socks_port", TOR_SOCKS_PORT)}'}
 
             self.app.update_progress(10)
-            response = requests.get(self.url, headers=headers, proxies=proxies, timeout=self.settings.get("timeout", 10))
-            response.raise_for_status()
-            self.app.update_progress(30)
+            
+            # Initialize JavaScript renderer if enabled
+            js_renderer = None
+            if self.app.js_render_var.get():
+                js_renderer = JavaScriptRenderer({
+                    'timeout': self.settings.get("timeout", 10),
+                    'render_wait': self.app.js_wait_var.get(),
+                    'proxy': proxies.get('http') if proxies else None
+                })
 
-            soup = BeautifulSoup(response.content, 'html.parser')
-            elements = soup.select(self.selector)
-            scraped_data = "\n".join([element.text.strip() for element in elements if self.running]) # Check if still running before processing
+            # Initialize pagination handler if enabled
+            if self.app.pagination_var.get():
+                pagination_handler = PaginationHandler(
+                    self.url,
+                    self.selector,
+                    {
+                        'pagination_selector': 'a[href*="page"]',
+                        'max_pages': self.app.max_pages_var.get(),
+                        'page_delay': self.app.page_delay_var.get()
+                    }
+                )
+                
+                # Scrape all pages
+                if js_renderer:
+                    all_elements = []
+                    for page_url in pagination_handler.get_all_page_urls():
+                        soup = js_renderer.render_page(page_url)
+                        all_elements.extend(soup.select(self.selector))
+                else:
+                    all_elements = pagination_handler.scrape_all_pages()
+                    
+                scraped_data = "\n".join([element.text.strip() for element in all_elements if self.running])
+            else:
+                # Single page scraping
+                if js_renderer:
+                    soup = js_renderer.render_page(self.url)
+                    elements = soup.select(self.selector)
+                else:
+                    response = requests.get(self.url, headers=headers, proxies=proxies, timeout=self.settings.get("timeout", 10))
+                    response.raise_for_status()
+                    self.app.update_progress(30)
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    elements = soup.select(self.selector)
+                    
+                scraped_data = "\n".join([element.text.strip() for element in elements if self.running])
 
             if self.running:
                 self.app.update_progress(80)
                 self.app.display_result(scraped_data)
-                self.app.update_progress(100)
+                
+                # Export to CSV if enabled
+                if self.app.export_csv_var.get():
+                    fields = [f.strip() for f in self.app.csv_fields_var.get().split(',')]
+                    filename = filedialog.asksaveasfilename(
+                        defaultextension=".csv",
+                        filetypes=[("CSV files", "*.csv")],
+                        title="Save CSV File"
+                    )
+                    if filename:
+                        CSVExporter.export(all_elements if self.app.pagination_var.get() else elements, filename, fields)
+                        self.app.status_label.config(text=f"Data exported to {filename}")
 
-                # Implement request delay
+                self.app.update_progress(100)
                 time.sleep(self.settings.get("request_delay", 1.0))
 
         except requests.exceptions.RequestException as e:
@@ -207,9 +290,12 @@ class WebScraperApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Web Scraper")
-        self.geometry("750x750")
-        self.resizable(True, True)  # Make resizable
-        self.minsize(600, 600)  # Set minimum size
+        self.state('zoomed')  # Start maximized
+        self.minsize(800, 600)  # Set minimum size
+        
+        # Configure main window resizing
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         self.settings = {}  # Initialize settings here
@@ -243,15 +329,130 @@ class WebScraperApp(tk.Tk):
         style = ttk.Style(self)
         style.theme_use('clam')
 
-        # Main Frame
-        main_frame = ttk.Frame(self, padding=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        # Main container with sidebar and content area
+        main_container = ttk.Frame(self)
+        main_container.grid(row=0, column=0, sticky="nsew")
+        
+        # Configure resizing behavior
+        main_container.grid_columnconfigure(0, weight=1, minsize=200)  # Sidebar
+        main_container.grid_columnconfigure(1, weight=3)  # Content
+        main_container.grid_rowconfigure(0, weight=1)
+        
+        # Sidebar frame
+        sidebar_frame = ttk.Frame(main_container, width=200)
+        sidebar_frame.grid(row=0, column=0, sticky="nsew")
+        sidebar_frame.grid_columnconfigure(0, weight=1)
+        sidebar_frame.grid_rowconfigure(0, weight=1)
+        
+        # Main frame inside sidebar
+        main_frame = ttk.Frame(sidebar_frame, padding=10)
+        main_frame.grid(row=0, column=0, sticky="nsew")
+        
+        # Content Frame (Resizable)
+        content_frame = ttk.Frame(main_container)
+        content_frame.grid(row=0, column=1, sticky="nsew")
+        content_frame.grid_columnconfigure(0, weight=1)
+        content_frame.grid_rowconfigure(0, weight=1)
+        
+        # Configure content area widgets
+        input_frame = ttk.Frame(content_frame)
+        input_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        input_frame.grid_columnconfigure(0, weight=1)
+        input_frame.grid_rowconfigure(0, weight=1)
+        
+        # Configure content area widgets
+        input_frame = ttk.Frame(content_frame)
+        input_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        input_frame.grid_columnconfigure(0, weight=1)
+        input_frame.grid_rowconfigure(0, weight=1)
+        
+        # Move all settings to sidebar
+        main_frame = ttk.Frame(sidebar_frame, padding=10)
+        main_frame.grid(row=0, column=0, sticky="nsew")
+        main_frame.grid_columnconfigure(0, weight=1)
+        main_frame.grid_rowconfigure(0, weight=1)
+
+        # Pagination Frame
+        pagination_frame = ttk.LabelFrame(main_frame, text="Pagination", padding=5)
+        pagination_frame.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        pagination_frame.grid_columnconfigure(0, weight=1)
+
+        self.pagination_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pagination_frame, text="Enable Pagination", variable=self.pagination_var).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(pagination_frame, text="Max Pages:").pack(side=tk.LEFT, padx=(10, 5))
+        self.max_pages_var = tk.IntVar(value=10)
+        ttk.Spinbox(pagination_frame, from_=1, to=1000, textvariable=self.max_pages_var, width=5).pack(side=tk.LEFT)
+
+        ttk.Label(pagination_frame, text="Page Delay:").pack(side=tk.LEFT, padx=(10, 5))
+        self.page_delay_var = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(pagination_frame, from_=0.1, to=10.0, increment=0.1, textvariable=self.page_delay_var, width=5).pack(side=tk.LEFT)
+
+        # Login Frame
+        login_frame = ttk.LabelFrame(main_frame, text="Login Credentials", padding=5)
+        login_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        login_frame.grid_columnconfigure(0, weight=1)
+
+        self.login_required_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(login_frame, text="Requires Login", variable=self.login_required_var).pack(side=tk.LEFT, padx=5)
+
+        # Username
+        username_label = ttk.Label(login_frame, text="Username:")
+        username_label.pack(pady=(0, 5))
+        self.username_var = tk.StringVar()
+        ttk.Entry(login_frame, textvariable=self.username_var, width=20).pack()
+
+        # Password
+        password_label = ttk.Label(login_frame, text="Password:")
+        password_label.pack(pady=(5, 0))
+        self.password_var = tk.StringVar()
+        ttk.Entry(login_frame, textvariable=self.password_var, show="*", width=20).pack()
+
+        # JavaScript Rendering Frame
+        js_frame = ttk.LabelFrame(main_frame, text="JavaScript Rendering", padding=5)
+        js_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        js_frame.grid_columnconfigure(0, weight=1)
+
+        self.js_render_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(js_frame, text="Enable JavaScript Rendering", variable=self.js_render_var).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(js_frame, text="Render Wait:").pack(side=tk.LEFT, padx=(10, 5))
+        self.js_wait_var = tk.DoubleVar(value=2.0)
+        ttk.Spinbox(js_frame, from_=0.1, to=10.0, increment=0.1, textvariable=self.js_wait_var, width=5).pack(side=tk.LEFT)
+
+        # Proxy Rotation Frame
+        proxy_rotation_frame = ttk.LabelFrame(main_frame, text="Proxy Rotation", padding=5)
+        proxy_rotation_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        proxy_rotation_frame.grid_columnconfigure(0, weight=1)
+
+        self.proxy_rotation_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(proxy_rotation_frame, text="Enable Proxy Rotation", variable=self.proxy_rotation_var).pack(side=tk.LEFT, padx=5)
+
+        # Proxy List
+        ttk.Label(proxy_rotation_frame, text="Proxy List:").pack(anchor="w")
+        self.proxy_list_var = tk.StringVar()
+        proxy_entry = ttk.Entry(proxy_rotation_frame, textvariable=self.proxy_list_var, width=30)
+        proxy_entry.pack(fill=tk.X, expand=True)
+        
+        # Load Button
+        ttk.Button(proxy_rotation_frame, text="Load from File", command=self.load_proxy_list).pack(pady=(5, 0))
+
+        # Export Frame
+        export_frame = ttk.LabelFrame(main_frame, text="Export Options", padding=5)
+        export_frame.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        export_frame.grid_columnconfigure(0, weight=1)
+
+        self.export_csv_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(export_frame, text="Export to CSV", variable=self.export_csv_var).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(export_frame, text="Fields:").pack(side=tk.LEFT, padx=(10, 5))
+        self.csv_fields_var = tk.StringVar(value="text,href")
+        ttk.Entry(export_frame, textvariable=self.csv_fields_var, width=20).pack(side=tk.LEFT)
 
         # Input Frame
         input_frame = ttk.LabelFrame(main_frame, text="Input", padding=10)
-        input_frame.pack(fill=tk.X, expand=True, pady=(0, 10))
+        input_frame.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        input_frame.grid_columnconfigure(0, weight=1)
 
         # URL
         ttk.Label(input_frame, text="URL:").grid(row=0, column=0, sticky="e")
@@ -298,7 +499,8 @@ class WebScraperApp(tk.Tk):
 
         # Buttons Frame
         buttons_frame = ttk.Frame(main_frame)
-        buttons_frame.pack(fill=tk.X, expand=True, pady=(5, 0))
+        buttons_frame.grid(row=6, column=0, sticky="ew", pady=(5, 0))
+        buttons_frame.grid_columnconfigure(0, weight=1)
 
         self.scrape_button = ttk.Button(buttons_frame, text="Start Scraping", command=self.start_scraping)
         self.scrape_button.pack(side=tk.LEFT, padx=5)
@@ -312,17 +514,21 @@ class WebScraperApp(tk.Tk):
         self.save_button = ttk.Button(buttons_frame, text="Save Data", command=self.save_data)
         self.save_button.pack(side=tk.LEFT, padx=5)
 
-        # Progress Bar
-        self.progress_bar = ttk.Progressbar(main_frame, orient="horizontal", mode="determinate")
-        self.progress_bar.pack(fill=tk.X, expand=True, pady=(10, 5))
+        # Progress Bar in content frame
+        self.progress_bar = ttk.Progressbar(content_frame, orient="horizontal", mode="determinate")
+        self.progress_bar.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        content_frame.grid_rowconfigure(0, weight=0)
 
-        # Output Text Area
-        self.output_text = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, state=tk.DISABLED)
-        self.output_text.pack(fill=tk.BOTH, expand=True)
+        # Output Text Area in content frame
+        self.output_text = scrolledtext.ScrolledText(content_frame, wrap=tk.WORD, state=tk.DISABLED)
+        self.output_text.grid(row=1, column=0, sticky="nsew")
+        content_frame.grid_rowconfigure(1, weight=1)
 
         # Status Bar
         self.status_label = ttk.Label(self, text="", anchor="w")
-        self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_label.grid(row=1, column=0, sticky="ew")
+        self.grid_rowconfigure(1, weight=0)
+        self.grid_columnconfigure(0, weight=1)
 
         # Menu Bar
         menu_bar = tk.Menu(self)
@@ -374,6 +580,53 @@ class WebScraperApp(tk.Tk):
         else:
             self.custom_selector_entry.delete(0, tk.END)
 
+    def perform_login(self, session, url, username, password):
+        """Performs login on the given URL using provided credentials."""
+        try:
+            response = session.get(url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Identify login form elements (adjust selectors as needed)
+            form = soup.find('form')
+            if not form:
+                self.show_error("Login form not found.")
+                return False
+            
+            inputs = form.find_all('input')
+            login_data = {}
+            for input_field in inputs:
+                name = input_field.get('name')
+                input_type = input_field.get('type')
+                if name:
+                    if input_type == 'text' or input_type == 'email':
+                        login_data[name] = username
+                    elif input_type == 'password':
+                        login_data[name] = password
+                    else:
+                        login_data[name] = input_field.get('value', '')  # For hidden fields, etc.
+
+            # Identify submit URL (form action)
+            login_url = response.urljoin(form.get('action')) if form.get('action') else url
+
+            # Submit the login form
+            login_response = session.post(login_url, data=login_data)
+            login_response.raise_for_status()
+
+            if login_response.url == url or "logout" in login_response.text.lower():
+                self.status_label.config(text="Login successful.")
+                return True
+            else:
+                self.show_error("Login failed. Please check your credentials.")
+                return False
+
+        except requests.exceptions.RequestException as e:
+            self.show_error(f"Login request error: {e}")
+            return False
+        except Exception as e:
+            self.show_error(f"Login error: {e}")
+            return False
+
     def start_scraping(self):
         """Starts the web scraping process."""
         url = self.url_input.get().strip()
@@ -389,14 +642,16 @@ class WebScraperApp(tk.Tk):
 
         if not url:
             messagebox.showerror("Error", "Please enter a URL.")
-        elif selector_category != "Custom" and not selector_value:
+        elif selector_category != "Custom" and not selector_value and selector_category != "Whole Website":
             messagebox.showerror("Error", "Please select a CSS selector or use a custom one.")
         elif selector_category == "Custom" and not selector:
             messagebox.showerror("Error", "Please enter a custom CSS selector.")
         elif network_option == "HTTP Proxy" and not proxy_address:
             messagebox.showerror("Error", "Please enter a proxy address.")
         else:
-            if selector_category != "Custom":
+            if selector_category == "Whole Website":
+                selector = "*"
+            elif selector_category != "Custom":
                 selector = CSS_SELECTORS[selector_category][selector_value]
 
             # Test connection before starting scraping
@@ -470,6 +725,22 @@ class WebScraperApp(tk.Tk):
         self.output_text.config(state=tk.NORMAL)
         self.output_text.delete(1.0, tk.END)
         self.output_text.config(state=tk.DISABLED)
+
+    def load_proxy_list(self):
+        """Loads a list of proxies from a file."""
+        file_path = filedialog.askopenfilename(
+            title="Select Proxy List File",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialdir=DEFAULT_SAVE_DIR
+        )
+        if file_path:
+            try:
+                with open(file_path, "r") as f:
+                    proxies = f.read().splitlines()
+                    self.proxy_list_var.set(",".join(proxies))
+                    messagebox.showinfo("Success", f"Loaded {len(proxies)} proxies")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load proxy list: {e}")
 
     def save_data(self):
         """Saves the scraped data to a file."""
